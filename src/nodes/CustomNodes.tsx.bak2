@@ -1,0 +1,208 @@
+import React, { useState, useCallback } from 'react';
+import { Handle, Position, NodeResizer, NodeProps } from 'reactflow';
+import { NodeData } from '../store/types';
+
+interface NodeShellProps extends NodeProps<NodeData> {
+  shape: React.ReactNode;
+  minW?: number;
+  minH?: number;
+}
+
+function NodeShell({ id, data, selected, shape, minW = 80, minH = 40 }: NodeShellProps) {
+  const [editing, setEditing] = useState(false);
+  const [label, setLabel] = useState(data.label);
+
+  const handleDblClick = useCallback(() => setEditing(true), []);
+  const handleBlur = useCallback(() => {
+    setEditing(false);
+    data.label = label;
+  }, [label, data]);
+
+  return (
+    <div className="relative" style={{ width: '100%', height: '100%' }}>
+      <NodeResizer minWidth={minW} minHeight={minH} isVisible={selected} color="#6366f1" />
+      <Handle type="target" position={Position.Top}    className="!w-2.5 !h-2.5 !bg-accent-500 !border-2 !border-white dark:!border-gray-800" />
+      <Handle type="source" position={Position.Bottom} className="!w-2.5 !h-2.5 !bg-accent-500 !border-2 !border-white dark:!border-gray-800" />
+      <Handle type="target" position={Position.Left}   className="!w-2.5 !h-2.5 !bg-accent-500 !border-2 !border-white dark:!border-gray-800" />
+      <Handle type="source" position={Position.Right}  className="!w-2.5 !h-2.5 !bg-accent-500 !border-2 !border-white dark:!border-gray-800" />
+      <div className="w-full h-full flex items-center justify-center" onDoubleClick={handleDblClick}>
+        {shape}
+        {editing ? (
+          <input
+            autoFocus
+            value={label}
+            onChange={e => setLabel(e.target.value)}
+            onBlur={handleBlur}
+            onKeyDown={e => {
+              // Stop Delete/Backspace from bubbling up to ReactFlow while editing label
+              if (e.key === 'Delete' || e.key === 'Backspace') {
+                e.stopPropagation();
+              }
+              if (e.key === 'Enter') handleBlur();
+              if (e.key === 'Escape') { setEditing(false); setLabel(data.label); }
+            }}
+            className="absolute z-10 text-center bg-white dark:bg-gray-800 border border-accent-400 rounded px-1 text-sm max-w-[90%]"
+            style={{ fontSize: data.fontSize || 13 }}
+          />
+        ) : (
+          <span
+            className="absolute inset-0 flex items-center justify-center text-center px-2 pointer-events-none"
+            style={{ fontSize: data.fontSize || 13 }}
+          >
+            {data.label}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function makeStyle(data: NodeData, extra?: React.CSSProperties): React.CSSProperties {
+  return {
+    background: data.color || '#fff',
+    border: `2px solid ${data.borderColor || '#6366f1'}`,
+    width: '100%', height: '100%',
+    ...extra,
+  };
+}
+
+export function ProcessNode(props: NodeProps<NodeData>) {
+  return <NodeShell {...props} shape={<div className="rounded-lg" style={makeStyle(props.data)} />} />;
+}
+
+export function DecisionNode(props: NodeProps<NodeData>) {
+  const { data } = props;
+  return (
+    <NodeShell {...props} minH={60} shape={
+      <svg width="100%" height="100%" viewBox="0 0 160 80" preserveAspectRatio="none" className="absolute inset-0">
+        <polygon points="80,4 156,40 80,76 4,40" fill={data.color || '#fef9c3'} stroke={data.borderColor || '#ca8a04'} strokeWidth="2" />
+      </svg>
+    } />
+  );
+}
+
+export function StartNode(props: NodeProps<NodeData>) {
+  return <NodeShell {...props} shape={<div className="rounded-full" style={makeStyle(props.data, { borderRadius: '50%' })} />} />;
+}
+
+export function EndNode(props: NodeProps<NodeData>) {
+  return <NodeShell {...props} shape={
+    <div className="rounded-full" style={makeStyle(
+      { ...props.data, color: props.data.color || '#fee2e2', borderColor: props.data.borderColor || '#dc2626' },
+      { borderRadius: '50%' }
+    )} />
+  } />;
+}
+
+export function DataNode(props: NodeProps<NodeData>) {
+  const { data } = props;
+  return (
+    <NodeShell {...props} shape={
+      <svg width="100%" height="100%" viewBox="0 0 160 60" preserveAspectRatio="none" className="absolute inset-0">
+        <polygon points="20,4 156,4 140,56 4,56" fill={data.color || '#f0fdf4'} stroke={data.borderColor || '#16a34a'} strokeWidth="2" />
+      </svg>
+    } />
+  );
+}
+
+export function ConnectorNode(props: NodeProps<NodeData>) {
+  return (
+    <NodeShell {...props} minW={40} minH={40} shape={
+      <div className="rounded-full border-2" style={{
+        background: props.data.color || '#f3f4f6',
+        borderColor: props.data.borderColor || '#6366f1',
+        width: '100%', height: '100%',
+      }} />
+    } />
+  );
+}
+
+export function AnnotationNode(props: NodeProps<NodeData>) {
+  const { data } = props;
+  return (
+    <NodeShell {...props} shape={
+      <div className="w-full h-full rounded-lg" style={{
+        background: data.color || '#fefce8',
+        border: `2px dashed ${data.borderColor || '#ca8a04'}`,
+      }} />
+    } />
+  );
+}
+
+export function ManualActionNode(props: NodeProps<NodeData>) {
+  const { data } = props;
+  return (
+    <NodeShell {...props} shape={
+      <svg width="100%" height="100%" viewBox="0 0 160 60" preserveAspectRatio="none" className="absolute inset-0">
+        <polygon points="0,60 160,60 148,0 12,0" fill={data.color || '#faf5ff'} stroke={data.borderColor || '#7c3aed'} strokeWidth="2" />
+      </svg>
+    } />
+  );
+}
+
+export function DatabaseNode(props: NodeProps<NodeData>) {
+  const { data } = props;
+  return (
+    <NodeShell {...props} shape={
+      <svg width="100%" height="100%" viewBox="0 0 160 80" preserveAspectRatio="none" className="absolute inset-0">
+        <ellipse cx="80" cy="16" rx="76" ry="14" fill={data.color || '#eff6ff'} stroke={data.borderColor || '#2563eb'} strokeWidth="2" />
+        <rect x="4" y="16" width="152" height="50" fill={data.color || '#eff6ff'} stroke="none" />
+        <line x1="4"   y1="16" x2="4"   y2="66" stroke={data.borderColor || '#2563eb'} strokeWidth="2" />
+        <line x1="156" y1="16" x2="156" y2="66" stroke={data.borderColor || '#2563eb'} strokeWidth="2" />
+        <ellipse cx="80" cy="66" rx="76" ry="14" fill={data.color || '#eff6ff'} stroke={data.borderColor || '#2563eb'} strokeWidth="2" />
+      </svg>
+    } />
+  );
+}
+
+export function DocumentNode(props: NodeProps<NodeData>) {
+  const { data } = props;
+  return (
+    <NodeShell {...props} shape={
+      <svg width="100%" height="100%" viewBox="0 0 160 72" preserveAspectRatio="none" className="absolute inset-0">
+        <path d="M4,4 H156 V56 Q120,72 80,60 Q40,48 4,64 Z" fill={data.color || '#fff7ed'} stroke={data.borderColor || '#ea580c'} strokeWidth="2" />
+      </svg>
+    } />
+  );
+}
+
+export function DelayNode(props: NodeProps<NodeData>) {
+  const { data } = props;
+  return (
+    <NodeShell {...props} shape={
+      <svg width="100%" height="100%" viewBox="0 0 160 60" preserveAspectRatio="none" className="absolute inset-0">
+        <path d="M4,4 H120 Q156,4 156,30 Q156,56 120,56 H4 Z" fill={data.color || '#f0fdf4'} stroke={data.borderColor || '#16a34a'} strokeWidth="2" />
+      </svg>
+    } />
+  );
+}
+
+export function SubprocessNode(props: NodeProps<NodeData>) {
+  const { data } = props;
+  return (
+    <NodeShell {...props} shape={
+      <div className="relative rounded-lg w-full h-full" style={{
+        background: data.color || '#eff6ff',
+        border: `2px solid ${data.borderColor || '#6366f1'}`,
+      }}>
+        <div className="absolute left-5 inset-y-0 border-l-2" style={{ borderColor: data.borderColor || '#6366f1' }} />
+        <div className="absolute right-5 inset-y-0 border-r-2" style={{ borderColor: data.borderColor || '#6366f1' }} />
+      </div>
+    } />
+  );
+}
+
+export const nodeTypes = {
+  process:       ProcessNode,
+  decision:      DecisionNode,
+  start:         StartNode,
+  end:           EndNode,
+  data:          DataNode,
+  connector:     ConnectorNode,
+  annotation:    AnnotationNode,
+  manual_action: ManualActionNode,
+  database:      DatabaseNode,
+  document:      DocumentNode,
+  delay:         DelayNode,
+  subprocess:    SubprocessNode,
+};

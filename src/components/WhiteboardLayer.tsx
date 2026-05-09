@@ -1,0 +1,1414 @@
+import React, {
+  useRef, useEffect, useState, useCallback, useLayoutEffect
+} from 'react';
+import {
+  Pen, Highlighter, Eraser, Square, Circle, Minus, Type, Trash2,
+  Undo2, Redo2, ArrowRight, Zap
+} from 'lucide-react';
+import { useZampFlowStore } from '../store/useZampFlowStore';
+import { Stroke } from '../store/types';
+
+// ─── Tool & Config types ──────────────────────────────────────────────────────
+type DrawTool =
+  | 'pen' | 'pencil' | 'marker' | 'highlighter' | 'eraser'
+  | 'rect' | 'circle' | 'line' | 'arrow' | 'text' | 'laser';
+
+interface LaserPoint { x: number; y: number; t: number; }
+
+interface WhiteboardLayerProps { active: boolean; }
+
+const PRESET_COLORS = [
+  '#ef4444','#f97316','#eab308','#22c55e',
+  '#3b82f6','#8b5cf6','#1e293b','#ffffff'
+];
+
+const FADE_PRESETS: Record<string, number> = { short: 800, medium: 1500, long: 3000 };
+
+// Tool defaults
+const TOOL_DEFAULTS: Record<DrawTool, { width: number; opacity: number }> = {
+  pen:         { width: 2,  opacity: 1.0  },
+  pencil:      { width: 1,  opacity: 0.70 },
+  marker:      { width: 6,  opacity: 1.0  },
+  highlighter: { width: 18, opacity: 0.35 },
+  eraser:      { width: 24, opacity: 1.0  },
+  rect:        { width: 2,  opacity: 1.0  },
+  circle:      { width: 2,  opacity: 1.0  },
+  line:        { width: 2,  opacity: 1.0  },
+  arrow:       { width: 2,  opacity: 1.0  },
+  text:        { width: 2,  opacity: 1.0  },
+  laser:       { width: 3,  opacity: 1.0  },
+};
+
+// Eraser sizes: S=12, M=24, L=48
+const ERASER_SIZES = { S: 12, M: 24, L: 48 };
+type EraserSize = 'S' | 'M' | 'L';
+
+// Neon laser colors
+const LASER_COLORS: Record<string, string> = {
+  red: '#ff3b30', green: '#00ff88', blue: '#00aaff', yellow: '#ffee00'
+};
+
+// ─── Utility: draw arrow head ──────────────────────────────────────────────────
+function drawArrowHead(ctx: CanvasRenderingContext2D, x1: number, y1: number, x2: number, y2: number, size = 12) {
+  const angle = Math.atan2(y2 - y1, x2 - x1);
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - size * Math.cos(angle - Math.PI / 6), y2 - size * Math.sin(angle - Math.PI / 6));
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - size * Math.cos(angle + Math.PI / 6), y2 - size * Math.sin(angle + Math.PI / 6));
+  ctx.stroke();
+}
+
+// ─── Pencil jitter ─────────────────────────────────────────────────────────────
+function jitter(v: number, amt = 0.4): number {
+  return v + (Math.random() - 0.5) * amt;
+}
+
+// ─── FIX 1: Smooth freehand stroke using quadratic midpoint curves ─────────────
+// This replaces the old segment-by-segment lineTo approach that produced dots.
+function drawSmoothStroke(
+  ctx: CanvasRenderingContext2D,
+  pts: { x: number; y: number }[],
+  tool: string,
+  strokeColor: string,
+  lineWidth: number,
+  opacity: number,
+  isDark = false
+) {
+  if (pts.length === 0) return;
+  ctx.save();
+  ctx.strokeStyle = strokeColor;
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.globalAlpha = opacity;
+
+  if (tool === 'highlighter') {
+    // On dark backgrounds multiply darkens to black — use screen or plain alpha instead
+    ctx.globalCompositeOperation = isDark ? 'source-over' : 'multiply';
+  } else {
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  if (pts.length === 1) {
+    // Single point: draw a dot
+    ctx.beginPath();
+    ctx.arc(pts[0].x, pts[0].y, lineWidth / 2, 0, Math.PI * 2);
+    ctx.fillStyle = strokeColor;
+    ctx.fill();
+    ctx.restore();
+    return;
+  }
+
+  ctx.beginPath();
+
+  if (tool === 'pencil') {
+    // Pencil: jitter + straight segments (textured feel)
+    ctx.moveTo(jitter(pts[0].x), jitter(pts[0].y));
+    for (let i = 1; i < pts.length - 1; i++) {
+      const mx = (pts[i].x + pts[i + 1].x) / 2;
+      const my = (pts[i].y + pts[i + 1].y) / 2;
+      ctx.quadraticCurveTo(jitter(pts[i].x, 0.8), jitter(pts[i].y, 0.8), jitter(mx, 0.3), jitter(my, 0.3));
+    }
+    ctx.lineTo(jitter(pts[pts.length - 1].x), jitter(pts[pts.length - 1].y));
+  } else {
+    // Pen, marker, highlighter: smooth quadratic midpoint curves
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length - 1; i++) {
+      const mx = (pts[i].x + pts[i + 1].x) / 2;
+      const my = (pts[i].y + pts[i + 1].y) / 2;
+      ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+    }
+    ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+  }
+
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ─── Full redraw helper ────────────────────────────────────────────────────────
+function redrawAllStrokes(
+  ctx: CanvasRenderingContext2D,
+  strokes: Stroke[]
+) {
+  ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+
+  // Detect dark mode by checking canvas background
+  const isDark = document.documentElement.classList.contains('dark');
+
+  strokes.forEach(stroke => {
+    ctx.save();
+
+    if (stroke.tool === 'text' && stroke.bounds && stroke.text) {
+      const fontSize = stroke.fontSize || 16;
+      ctx.font = `${fontSize}px Inter, sans-serif`;
+      ctx.fillStyle = stroke.color;
+      ctx.globalAlpha = stroke.opacity ?? 1;
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillText(stroke.text, stroke.bounds.x, stroke.bounds.y + fontSize);
+      ctx.restore();
+      return;
+    }
+
+    if (stroke.tool === 'shape' && stroke.bounds) {
+      const { x, y, w, h } = stroke.bounds;
+      ctx.globalAlpha = stroke.opacity ?? 1;
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.strokeStyle = stroke.color;
+      ctx.fillStyle = stroke.color;
+      ctx.lineWidth = stroke.width;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      if (stroke.shape === 'rect') {
+        ctx.strokeRect(x, y, w, h);
+      } else if (stroke.shape === 'circle') {
+        ctx.ellipse(x + w / 2, y + h / 2, Math.abs(w / 2), Math.abs(h / 2), 0, 0, Math.PI * 2);
+        ctx.stroke();
+      } else if (stroke.shape === 'line') {
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + w, y + h);
+        ctx.stroke();
+      } else if (stroke.shape === 'arrow') {
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + w, y + h);
+        ctx.stroke();
+        drawArrowHead(ctx, x, y, x + w, y + h, stroke.width * 4 + 6);
+      }
+      ctx.restore();
+      return;
+    }
+
+    // Freehand tools — use smooth drawing for all
+    if (!stroke.points || stroke.points.length === 0) { ctx.restore(); return; }
+
+    drawSmoothStroke(
+      ctx,
+      stroke.points,
+      stroke.tool,
+      stroke.color,
+      stroke.width,
+      stroke.opacity ?? 1,
+      isDark
+    );
+
+    ctx.restore();
+  });
+}
+
+// ─── Draw neon laser trail ────────────────────────────────────────────────────
+function drawNeonTrail(
+  ctx: CanvasRenderingContext2D,
+  points: LaserPoint[],
+  color: string,
+  fadeMs: number,
+  tipPx: number
+) {
+  if (points.length === 0) return;
+  const now = performance.now();
+
+  if (points.length >= 2) {
+    for (let i = 1; i < points.length; i++) {
+      const p0 = points[i - 1];
+      const p1 = points[i];
+      const age1 = (now - p1.t) / fadeMs;
+      const alpha = Math.max(0, 1 - age1);
+      if (alpha <= 0) continue;
+
+      ctx.save();
+
+      ctx.globalAlpha = alpha * 0.25;
+      ctx.lineWidth = 14;
+      ctx.strokeStyle = color;
+      ctx.shadowBlur = 20;
+      ctx.shadowColor = color;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+
+      ctx.globalAlpha = alpha * 0.6;
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = color;
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = color;
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+
+      ctx.globalAlpha = alpha * 0.95;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.shadowBlur = 4;
+      ctx.shadowColor = '#ffffff';
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  }
+
+  const latest = points[points.length - 1];
+  if (latest && (now - latest.t) < 120) {
+    ctx.save();
+
+    ctx.globalAlpha = 0.3;
+    ctx.beginPath();
+    ctx.arc(latest.x, latest.y, tipPx, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.shadowBlur = 24;
+    ctx.shadowColor = color;
+    ctx.fill();
+
+    ctx.globalAlpha = 0.7;
+    ctx.beginPath();
+    ctx.arc(latest.x, latest.y, tipPx * 0.55, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = color;
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.arc(latest.x, latest.y, tipPx * 0.25, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowBlur = 6;
+    ctx.shadowColor = '#ffffff';
+    ctx.fill();
+
+    ctx.restore();
+  }
+}
+
+// ─── Tooltip wrapper ──────────────────────────────────────────────────────────
+function TooltipBtn({
+  onClick, title, active, className, children, disabled
+}: {
+  onClick?: () => void;
+  title: string;
+  active?: boolean;
+  className?: string;
+  children: React.ReactNode;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="relative group flex-shrink-0">
+      <button
+        onClick={onClick}
+        title={title}
+        disabled={disabled}
+        className={className}
+      >
+        {children}
+      </button>
+      <div className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 rounded bg-gray-900 text-white text-[10px] whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-50 shadow-lg">
+        {title}
+        <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-gray-900" />
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Component ────────────────────────────────────────────────────────────
+export function WhiteboardLayer({ active }: WhiteboardLayerProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const laserCanvasRef = useRef<HTMLCanvasElement>(null);
+  const eraserCanvasRef = useRef<HTMLCanvasElement>(null);
+  // Text input ref for forced focus
+  const textInputRef = useRef<HTMLInputElement>(null);
+
+  const [tool, setTool] = useState<DrawTool>('pen');
+  const [color, setColor] = useState('#6366f1');
+  const [strokeWidth, setStrokeWidth] = useState(2);
+
+  // FIX 2: eraser size state (S/M/L)
+  const [eraserSize, setEraserSize] = useState<EraserSize>('M');
+
+  const [laserColor, setLaserColor] = useState('red');
+  const [laserFade, setLaserFade] = useState<'short'|'medium'|'long'>('short');
+  const [laserTipSize, setLaserTipSize] = useState<'S'|'M'|'L'>('S');
+  const [laserActive, setLaserActive] = useState(false);
+  const [showLaserConfig, setShowLaserConfig] = useState(false);
+
+  const [undoStack, setUndoStack] = useState<Stroke[][]>([]);
+  const [redoStack, setRedoStack] = useState<Stroke[][]>([]);
+
+  // Text input state: canvas coords (x,y) + screen coords (screenX, screenY) for fixed positioning
+  const [textInput, setTextInput] = useState<{ x: number; y: number; screenX: number; screenY: number } | null>(null);
+  const [textValue, setTextValue] = useState('');
+
+  const drawing = useRef(false);
+  const currentPath = useRef<{ x: number; y: number }[]>([]);
+  const startPos = useRef({ x: 0, y: 0 });
+  const rafId = useRef<number>(0);
+
+  // FIX 2: ref to track strokes deleted during an eraser drag (for single undo)
+  const eraserDeletedStrokes = useRef<Stroke[] | null>(null);
+
+  const laserPoints = useRef<LaserPoint[]>([]);
+  const laserRafId = useRef<number>(0);
+  const laserRunning = useRef(false);
+  const prevToolBeforeLaser = useRef<DrawTool>('pen');
+
+  const [confirmClear, setConfirmClear] = useState(false);
+
+  const { activeProcess, setWhiteboard } = useZampFlowStore();
+
+  const getCtx = () => canvasRef.current?.getContext('2d');
+  const getLaserCtx = () => laserCanvasRef.current?.getContext('2d');
+  const getEraserCtx = () => eraserCanvasRef.current?.getContext('2d');
+
+  const getStrokes = useCallback((): Stroke[] => {
+    return activeProcess()?.whiteboard?.strokes ?? [];
+  }, [activeProcess]);
+
+  const saveStrokes = useCallback((strokes: Stroke[]) => {
+    const proc = activeProcess();
+    if (!proc) return;
+    setWhiteboard({ ...proc.whiteboard, strokes });
+  }, [activeProcess, setWhiteboard]);
+
+  const resizeCanvases = useCallback(() => {
+    const parent = canvasRef.current?.parentElement;
+    if (!parent) return;
+    const { width, height } = parent.getBoundingClientRect();
+    [canvasRef, laserCanvasRef, eraserCanvasRef].forEach(ref => {
+      const c = ref.current;
+      if (!c) return;
+      c.width = width;
+      c.height = height;
+    });
+    const ctx = getCtx();
+    if (ctx) redrawAllStrokes(ctx, getStrokes());
+  }, [getStrokes]);
+
+  useLayoutEffect(() => {
+    resizeCanvases();
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener('resize', resizeCanvases);
+    return () => window.removeEventListener('resize', resizeCanvases);
+  }, [resizeCanvases]);
+
+  useEffect(() => {
+    const ctx = getCtx();
+    if (!ctx) return;
+    redrawAllStrokes(ctx, getStrokes());
+  }, [getStrokes]);
+
+  const getPos = (e: React.PointerEvent | PointerEvent | MouseEvent) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  };
+
+  // Tip sizes: S=4px core, M=6px core, L=10px core (spec values)
+  const LASER_TIP_SIZES = { S: 4, M: 6, L: 10 };
+
+  // Track cursor position for always-visible dot
+  const cursorPos = useRef<{ x: number; y: number } | null>(null);
+  const cursorVisible = useRef(false);
+  // Last event name (for ?laserDebug=1 overlay)
+  const lastEventRef = useRef<string>('(none)');
+  // Debug mode toggled via ?laserDebug=1 in URL
+  const [laserDebug] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('laserDebug') === '1';
+  });
+  // Tick state to force re-render of debug overlay every animation frame
+  const [debugTick, setDebugTick] = useState(0);
+  useEffect(() => {
+    if (!laserDebug) return;
+    let id = 0;
+    const loop = () => { setDebugTick(t => (t + 1) & 0x7fffffff); id = requestAnimationFrame(loop); };
+    id = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(id);
+  }, [laserDebug]);
+
+  // ── Draw the neon dot at cursor position ───────────────────────────────────
+  function drawNeonDot(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    color: string,
+    tipSize: number
+  ) {
+    // Outer halo
+    ctx.save();
+    ctx.globalAlpha = 0.15;
+    ctx.beginPath();
+    ctx.arc(x, y, tipSize * 3, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.shadowBlur = 20;
+    ctx.shadowColor = color;
+    ctx.fill();
+    ctx.restore();
+
+    // Mid halo
+    ctx.save();
+    ctx.globalAlpha = 0.4;
+    ctx.beginPath();
+    ctx.arc(x, y, tipSize * 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = color;
+    ctx.fill();
+    ctx.restore();
+
+    // White core with slight tint
+    ctx.save();
+    ctx.globalAlpha = 1.0;
+    ctx.beginPath();
+    ctx.arc(x, y, tipSize, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowBlur = 6;
+    ctx.shadowColor = color;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  const stopLaserLoop = useCallback(() => {
+    laserRunning.current = false;
+    cancelAnimationFrame(laserRafId.current);
+    const ctx = getLaserCtx();
+    if (ctx) ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    laserPoints.current = [];
+  }, []);
+
+  useEffect(() => {
+    if (!laserActive) {
+      stopLaserLoop();
+      // Restore cursor
+      document.body.style.cursor = '';
+      return;
+    }
+
+    // Hide system cursor while laser is active
+    document.body.style.cursor = 'none';
+
+    // Start RAF loop
+    laserRunning.current = true;
+    const col = LASER_COLORS[laserColor] ?? '#ff3b30';
+    const tipPx = LASER_TIP_SIZES[laserTipSize] ?? 6;
+    const fadeMs = FADE_PRESETS[laserFade] ?? 1500;
+
+    const loop = () => {
+      if (!laserRunning.current) return;
+      const ctx = getLaserCtx();
+      if (!ctx) { laserRafId.current = requestAnimationFrame(loop); return; }
+
+      const now = performance.now();
+
+      // Prune expired trail points
+      laserPoints.current = laserPoints.current.filter(p => (now - p.t) < fadeMs);
+
+      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+
+      // 1. Render trail only when right mouse is held OR points still fading
+      if (laserPoints.current.length >= 2) {
+        // Smooth quadratic path with per-segment alpha fade
+        const pts = laserPoints.current;
+
+        // Pass 1: outer glow
+        for (let i = 1; i < pts.length; i++) {
+          const p0 = pts[i - 1];
+          const p1 = pts[i];
+          const age = (now - p1.t) / fadeMs;
+          const alpha = Math.max(0, 1 - age);
+          if (alpha <= 0) continue;
+          ctx.save();
+          ctx.globalAlpha = alpha * 0.25;
+          ctx.lineWidth = 14;
+          ctx.strokeStyle = col;
+          ctx.shadowBlur = 20;
+          ctx.shadowColor = col;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.beginPath();
+          if (i === 1) {
+            ctx.moveTo(p0.x, p0.y);
+          } else {
+            const prev = pts[i - 2];
+            const mx0 = (prev.x + p0.x) / 2;
+            const my0 = (prev.y + p0.y) / 2;
+            ctx.moveTo(mx0, my0);
+          }
+          const mx1 = (p0.x + p1.x) / 2;
+          const my1 = (p0.y + p1.y) / 2;
+          ctx.quadraticCurveTo(p0.x, p0.y, mx1, my1);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Pass 2: mid glow
+        for (let i = 1; i < pts.length; i++) {
+          const p0 = pts[i - 1];
+          const p1 = pts[i];
+          const age = (now - p1.t) / fadeMs;
+          const alpha = Math.max(0, 1 - age);
+          if (alpha <= 0) continue;
+          ctx.save();
+          ctx.globalAlpha = alpha * 0.6;
+          ctx.lineWidth = 6;
+          ctx.strokeStyle = col;
+          ctx.shadowBlur = 10;
+          ctx.shadowColor = col;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.beginPath();
+          if (i === 1) {
+            ctx.moveTo(p0.x, p0.y);
+          } else {
+            const prev = pts[i - 2];
+            const mx0 = (prev.x + p0.x) / 2;
+            const my0 = (prev.y + p0.y) / 2;
+            ctx.moveTo(mx0, my0);
+          }
+          const mx1 = (p0.x + p1.x) / 2;
+          const my1 = (p0.y + p1.y) / 2;
+          ctx.quadraticCurveTo(p0.x, p0.y, mx1, my1);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Pass 3: white core
+        for (let i = 1; i < pts.length; i++) {
+          const p0 = pts[i - 1];
+          const p1 = pts[i];
+          const age = (now - p1.t) / fadeMs;
+          const alpha = Math.max(0, 1 - age);
+          if (alpha <= 0) continue;
+          ctx.save();
+          ctx.globalAlpha = alpha * 0.95;
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = '#ffffff';
+          ctx.shadowBlur = 4;
+          ctx.shadowColor = '#ffffff';
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.beginPath();
+          if (i === 1) {
+            ctx.moveTo(p0.x, p0.y);
+          } else {
+            const prev = pts[i - 2];
+            const mx0 = (prev.x + p0.x) / 2;
+            const my0 = (prev.y + p0.y) / 2;
+            ctx.moveTo(mx0, my0);
+          }
+          const mx1 = (p0.x + p1.x) / 2;
+          const my1 = (p0.y + p1.y) / 2;
+          ctx.quadraticCurveTo(p0.x, p0.y, mx1, my1);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      // 2. ALWAYS render dot at cursor position (when cursor is in window)
+      if (cursorVisible.current && cursorPos.current) {
+        drawNeonDot(ctx, cursorPos.current.x, cursorPos.current.y, col, tipPx);
+      }
+
+      laserRafId.current = requestAnimationFrame(loop);
+    };
+    laserRafId.current = requestAnimationFrame(loop);
+
+    // ── Event listeners ────────────────────────────────────────────────────
+    //
+    // ALWAYS-PAINT MODE: every pointermove paints a trail point.
+    // No button/gesture gating needed — the trail follows the cursor at all times
+    // while the laser tool is active.
+    //
+    // We still suppress contextmenu and auxclick so right-click / two-finger tap
+    // never shows the native or React Flow context menus while laser is on.
+    //
+    // State refs:
+    //   • lastEventRef  — last event name, surfaced in debug overlay
+
+    // Min-distance filter: don't push a point if cursor moved < 2px (avoids spamming
+    // points when the cursor is nearly still, e.g. on a resting trackpad).
+    const MIN_DIST_SQ = 4; // 2² px
+
+    const pushPoint = (x: number, y: number) => {
+      const pts = laserPoints.current;
+      if (pts.length > 0) {
+        const last = pts[pts.length - 1];
+        const dx = x - last.x, dy = y - last.y;
+        if (dx * dx + dy * dy < MIN_DIST_SQ) return; // below min-distance threshold
+      }
+      pts.push({ x, y, t: performance.now() });
+      if (pts.length > 600) pts.shift();
+    };
+
+    const onPointerMoveWin = (e: PointerEvent) => {
+      const canvas = laserCanvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      cursorPos.current = { x, y };
+      cursorVisible.current = true;
+
+      // Always-paint: push trail point on every move (min-distance filtered above).
+      pushPoint(x, y);
+      lastEventRef.current = 'pointermove';
+    };
+
+    const onPointerLeaveWin = () => {
+      cursorVisible.current = false;
+      lastEventRef.current = 'pointerleave';
+    };
+    const onPointerEnterWin = () => {
+      cursorVisible.current = true;
+      lastEventRef.current = 'pointerenter';
+    };
+
+    // Always swallow context menu while laser is on (right-click / two-finger tap).
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      lastEventRef.current = 'contextmenu';
+    };
+
+    // Some browsers fire auxclick on right-button release; suppress its default too.
+    const onAuxClick = (e: MouseEvent) => {
+      if (e.button === 2) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+
+    // All listeners attached on WINDOW in CAPTURE phase so we win against React Flow.
+    window.addEventListener('pointermove', onPointerMoveWin, true);
+    window.addEventListener('pointerleave', onPointerLeaveWin, true);
+    window.addEventListener('pointerenter', onPointerEnterWin, true);
+    window.addEventListener('contextmenu', onContextMenu, true);
+    window.addEventListener('auxclick', onAuxClick, true);
+    cursorVisible.current = true; // assume in window until told otherwise
+
+    return () => {
+      laserRunning.current = false;
+      cancelAnimationFrame(laserRafId.current);
+      window.removeEventListener('pointermove', onPointerMoveWin, true);
+      window.removeEventListener('pointerleave', onPointerLeaveWin, true);
+      window.removeEventListener('pointerenter', onPointerEnterWin, true);
+      window.removeEventListener('contextmenu', onContextMenu, true);
+      window.removeEventListener('auxclick', onAuxClick, true);
+      // Restore cursor
+      document.body.style.cursor = '';
+      // Clear canvas
+      const ctx = getLaserCtx();
+      if (ctx) ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      laserPoints.current = [];
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [laserActive, laserColor, laserFade, laserTipSize]);
+
+  // ── LASER BEHAVIOR TEST PLAN (always-paint mode) ──────────────────────────────
+  //  1. Activate laser (L). Cursor hidden via body.cursor='none'. Neon dot follows mouse
+  //     because pointermove updates cursorPos and rAF loop calls drawNeonDot every frame.   ✓
+  //  2. Move mouse (no click needed). pointermove pushes a trail point on every move
+  //     (min-distance 2px filter prevents spamming when cursor is still). rAF loop draws
+  //     fading neon trail behind the dot.                                                   ✓
+  //  3. One-finger trackpad drag. Same as #2 — pointermove fires, trail paints.             ✓
+  //  4. Trail fades. rAF loop prunes points older than fadeMs; trail disappears naturally
+  //     when cursor stops; no explicit "stop drawing" gesture needed.                       ✓
+  //  5. Right-click / Ctrl+click / two-finger tap. contextmenu preventDefault+stopProp
+  //     suppresses native and React Flow context menus. No special trail behavior needed —
+  //     movement already paints. auxclick is also suppressed.                               ✓
+  //  6. Pointer leaves window. pointerleave hides the dot (cursorVisible=false); trail
+  //     keeps fading. pointerenter restores dot when cursor returns.                        ✓
+  //  7. Press L. toggleLaser flips laserActive; effect cleanup removes all 5 listeners,
+  //     restores body.cursor, clears the laser canvas.                                      ✓
+  //  8. Press Esc. Keyboard handler calls toggleLaser if laserActive — same cleanup path.   ✓
+  //
+  // Listener phase: ALL window listeners use capture=true so React Flow's bubble-phase
+  // contextmenu handler cannot fire before us. React Flow attaches its handler to the
+  // pane element (not window), so window-capture always wins.
+
+  // ── FIX 2: Eraser preview ring — radius matches actual erase radius ───────────
+  const getEraserRadius = useCallback(() => {
+    return ERASER_SIZES[eraserSize];
+  }, [eraserSize]);
+
+  const showEraserRing = useCallback((x: number, y: number) => {
+    const ctx = getEraserCtx();
+    if (!ctx) return;
+    const radius = getEraserRadius();
+    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(100,100,100,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }, [getEraserRadius]);
+
+  const clearEraserRing = useCallback(() => {
+    const ctx = getEraserCtx();
+    if (ctx) ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  }, []);
+
+  // ── FIX 2: Live eraser — delete whole strokes while dragging ─────────────────
+  const applyEraserAt = useCallback((cx: number, cy: number) => {
+    const radius = getEraserRadius();
+    const prev = getStrokes();
+    const filtered = prev.filter(stroke => {
+      // Freehand strokes: check every point
+      if (stroke.points && stroke.points.length > 0) {
+        return !stroke.points.some(pt =>
+          Math.hypot(pt.x - cx, pt.y - cy) < radius
+        );
+      }
+      // Shape strokes: check bounding box edges/corners
+      if (stroke.tool === 'shape' && stroke.bounds) {
+        const { x, y, w, h } = stroke.bounds;
+        const x2 = x + w, y2 = y + h;
+        // Check if cursor is near any corner or edge midpoint
+        const checkPoints = [
+          { x, y }, { x: x2, y }, { x, y: y2 }, { x: x2, y: y2 },
+          { x: (x + x2) / 2, y }, { x: (x + x2) / 2, y: y2 },
+          { x, y: (y + y2) / 2 }, { x: x2, y: (y + y2) / 2 },
+          { x: (x + x2) / 2, y: (y + y2) / 2 },
+        ];
+        return !checkPoints.some(pt => Math.hypot(pt.x - cx, pt.y - cy) < radius);
+      }
+      // Text strokes: check bounds center
+      if (stroke.tool === 'text' && stroke.bounds) {
+        const { x, y, w, h } = stroke.bounds;
+        const centerX = x + (w ?? 0) / 2;
+        const centerY = y + (h ?? 0) / 2;
+        return Math.hypot(centerX - cx, centerY - cy) >= radius;
+      }
+      return true;
+    });
+
+    if (filtered.length !== prev.length) {
+      // Save the pre-erase state once (on first deletion in drag)
+      if (eraserDeletedStrokes.current === null) {
+        eraserDeletedStrokes.current = prev;
+      }
+      saveStrokes(filtered);
+      const ctx = getCtx();
+      if (ctx) redrawAllStrokes(ctx, filtered);
+    }
+  }, [getEraserRadius, getStrokes, saveStrokes]);
+
+  // ── Pointer handlers ──────────────────────────────────────────────────────────
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
+    if (!active || tool === 'laser') return;
+
+    // Text tool — record canvas coords + screen coords, show input
+    if (tool === 'text') {
+      const pos = getPos(e);
+      console.log('[text tool] click at canvas', pos.x, pos.y, 'screen', e.clientX, e.clientY);
+      setTextInput({ x: pos.x, y: pos.y, screenX: e.clientX, screenY: e.clientY });
+      setTextValue('');
+      return;
+    }
+
+    if (tool === 'eraser') {
+      drawing.current = true;
+      eraserDeletedStrokes.current = null; // reset for this drag session
+      canvasRef.current?.setPointerCapture(e.pointerId);
+      const pos = getPos(e);
+      applyEraserAt(pos.x, pos.y);
+      return;
+    }
+
+    drawing.current = true;
+    const pos = getPos(e);
+    startPos.current = pos;
+    currentPath.current = [pos];
+    canvasRef.current?.setPointerCapture(e.pointerId);
+  }, [active, tool, applyEraserAt]);
+
+  const onPointerMove = useCallback((e: React.PointerEvent) => {
+    if (!active) return;
+    const pos = getPos(e);
+
+    if (tool === 'eraser') {
+      showEraserRing(pos.x, pos.y);
+      if (drawing.current) {
+        applyEraserAt(pos.x, pos.y);
+      }
+      return;
+    }
+
+    if (!drawing.current) return;
+
+    cancelAnimationFrame(rafId.current);
+    currentPath.current.push(pos);
+
+    rafId.current = requestAnimationFrame(() => {
+      const ctx = getCtx();
+      if (!ctx) return;
+      const pts = currentPath.current;
+
+      if (['pen','pencil','marker','highlighter'].includes(tool)) {
+        // FIX 1: Redraw everything + the in-progress stroke smoothly
+        redrawAllStrokes(ctx, getStrokes());
+        const isDark = document.documentElement.classList.contains('dark');
+        drawSmoothStroke(ctx, pts, tool, color, strokeWidth, 
+          tool === 'highlighter' ? 0.35 : tool === 'pencil' ? 0.7 : 1,
+          isDark
+        );
+      } else if (['rect','circle','line','arrow'].includes(tool)) {
+        redrawAllStrokes(ctx, getStrokes());
+        const sx = startPos.current.x, sy = startPos.current.y;
+        const w = pos.x - sx, h = pos.y - sy;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = strokeWidth;
+        ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        if (tool === 'rect') {
+          ctx.strokeRect(sx, sy, w, h);
+        } else if (tool === 'circle') {
+          ctx.ellipse(sx + w / 2, sy + h / 2, Math.abs(w / 2), Math.abs(h / 2), 0, 0, Math.PI * 2);
+          ctx.stroke();
+        } else if (tool === 'line') {
+          ctx.moveTo(sx, sy); ctx.lineTo(pos.x, pos.y); ctx.stroke();
+        } else if (tool === 'arrow') {
+          ctx.moveTo(sx, sy); ctx.lineTo(pos.x, pos.y); ctx.stroke();
+          drawArrowHead(ctx, sx, sy, pos.x, pos.y, strokeWidth * 4 + 6);
+        }
+        ctx.restore();
+      }
+    });
+  }, [active, tool, color, strokeWidth, getStrokes, showEraserRing, applyEraserAt]);
+
+  const commitStroke = useCallback((newStroke: Stroke) => {
+    const prev = getStrokes();
+    setUndoStack(s => [...s.slice(-30), prev]);
+    setRedoStack([]);
+    saveStrokes([...prev, newStroke]);
+  }, [getStrokes, saveStrokes]);
+
+  const onPointerUp = useCallback((e: React.PointerEvent) => {
+    if (!active || tool === 'laser') return;
+
+    // FIX 2: Eraser — push ONE undo entry for the whole drag
+    if (tool === 'eraser') {
+      drawing.current = false;
+      clearEraserRing();
+      if (eraserDeletedStrokes.current !== null) {
+        // The strokes were already saved live; just push the pre-drag state onto undo
+        setUndoStack(s => [...s.slice(-30), eraserDeletedStrokes.current!]);
+        setRedoStack([]);
+        eraserDeletedStrokes.current = null;
+      }
+      currentPath.current = [];
+      return;
+    }
+
+    if (!drawing.current) return;
+    drawing.current = false;
+
+    if (['pen','pencil','marker','highlighter'].includes(tool) && currentPath.current.length > 1) {
+      const stroke: Stroke = {
+        id: crypto.randomUUID(),
+        tool: tool as any,
+        color,
+        width: strokeWidth,
+        opacity: tool === 'highlighter' ? 0.35 : tool === 'pencil' ? 0.7 : 1,
+        points: [...currentPath.current],
+      };
+      commitStroke(stroke);
+    }
+
+    if (['rect','circle','line','arrow'].includes(tool)) {
+      const pos = getPos(e);
+      const sx = startPos.current.x, sy = startPos.current.y;
+      const stroke: Stroke = {
+        id: crypto.randomUUID(),
+        tool: 'shape',
+        shape: tool as any,
+        color,
+        width: strokeWidth,
+        opacity: 1,
+        points: [],
+        bounds: { x: sx, y: sy, w: pos.x - sx, h: pos.y - sy },
+      };
+      commitStroke(stroke);
+    }
+
+    currentPath.current = [];
+  }, [active, tool, color, strokeWidth, getStrokes, saveStrokes, commitStroke, clearEraserRing]);
+
+  // ── Undo / Redo ───────────────────────────────────────────────────────────────
+  const handleUndo = useCallback(() => {
+    if (!undoStack.length) return;
+    const prev = undoStack[undoStack.length - 1];
+    setRedoStack(r => [...r, getStrokes()]);
+    setUndoStack(s => s.slice(0, -1));
+    saveStrokes(prev);
+    const ctx = getCtx();
+    if (ctx) redrawAllStrokes(ctx, prev);
+  }, [undoStack, getStrokes, saveStrokes]);
+
+  const handleRedo = useCallback(() => {
+    if (!redoStack.length) return;
+    const next = redoStack[redoStack.length - 1];
+    setUndoStack(s => [...s, getStrokes()]);
+    setRedoStack(r => r.slice(0, -1));
+    saveStrokes(next);
+    const ctx = getCtx();
+    if (ctx) redrawAllStrokes(ctx, next);
+  }, [redoStack, getStrokes, saveStrokes]);
+
+  // ── Clear all ─────────────────────────────────────────────────────────────────
+  const handleClear = useCallback(() => {
+    const prev = getStrokes();
+    if (prev.length === 0) { setConfirmClear(false); return; }
+    setUndoStack(s => [...s.slice(-30), prev]);
+    setRedoStack([]);
+    saveStrokes([]);
+    const ctx = getCtx();
+    if (ctx) ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    setConfirmClear(false);
+  }, [getStrokes, saveStrokes]);
+
+  // ── Text commit: takes current snapshot of textInput+textValue to avoid stale closure bugs
+  const doCommitText = useCallback((inp: typeof textInput, val: string) => {
+    console.log('[text commit] canvas=', inp?.x, inp?.y, 'value=', JSON.stringify(val));
+    setTextInput(null);
+    setTextValue('');
+    if (!inp || !val.trim()) return; // no empty strokes
+    const fontSize = Math.min(48, Math.max(12, strokeWidth * 6));
+    const stroke: Stroke = {
+      id: crypto.randomUUID(),
+      tool: 'text',
+      color,
+      width: 1,
+      opacity: 1,
+      points: [],
+      bounds: { x: inp.x, y: inp.y, w: 200, h: fontSize + 4 },
+      text: val,
+      fontSize,
+    };
+    commitStroke(stroke);
+  }, [color, strokeWidth, commitStroke]);
+
+  // Focus the text input synchronously after it mounts (no setTimeout — React commit phase is done)
+  useEffect(() => {
+    if (textInput) {
+      console.log('[text input mounted] attempting focus');
+      textInputRef.current?.focus();
+    }
+  }, [textInput?.x, textInput?.y]);
+
+  // ── Toggle laser ──────────────────────────────────────────────────────────────
+  const toggleLaser = useCallback(() => {
+    setLaserActive(v => {
+      const next = !v;
+      if (next) {
+        prevToolBeforeLaser.current = tool === 'laser' ? 'pen' : tool;
+        setTool('laser');
+      } else {
+        setTool(prevToolBeforeLaser.current);
+      }
+      return next;
+    });
+  }, [tool]);
+
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────────
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      switch (e.key) {
+        case 'p': case 'P':
+          if (active) { setTool('pen'); setLaserActive(false); } break;
+        case 'b': case 'B':
+          if (active) { setTool('pencil'); setLaserActive(false); } break;
+        case 'm': case 'M':
+          if (active) { setTool('marker'); setLaserActive(false); } break;
+        case 'h': case 'H':
+          if (active) { setTool('highlighter'); setLaserActive(false); } break;
+        case 'e': case 'E':
+          if (active) { setTool('eraser'); setLaserActive(false); } break;
+        case 't': case 'T':
+          if (active) { setTool('text'); setLaserActive(false); } break;
+        case 'r': case 'R':
+          if (active) { setTool('rect'); setLaserActive(false); } break;
+        case 'o': case 'O':
+          if (active) { setTool('circle'); setLaserActive(false); } break;
+        case 'a': case 'A':
+          if (active) { setTool('arrow'); setLaserActive(false); } break;
+        case 'l': case 'L': toggleLaser(); break;
+        case 'Escape':
+          if (laserActive) toggleLaser();
+          setTextInput(null);
+          break;
+        case '[':
+          setStrokeWidth(w => Math.max(1, w - 1));
+          break;
+        case ']':
+          setStrokeWidth(w => Math.min(30, w + 1));
+          break;
+        case 'z':
+          if ((e.ctrlKey || e.metaKey) && !e.shiftKey && active) {
+            e.preventDefault(); e.stopPropagation(); handleUndo();
+          }
+          if ((e.ctrlKey || e.metaKey) && e.shiftKey && active) {
+            e.preventDefault(); e.stopPropagation(); handleRedo();
+          }
+          break;
+        default:
+          if (/^[1-8]$/.test(e.key)) {
+            const idx = parseInt(e.key) - 1;
+            if (PRESET_COLORS[idx]) setColor(PRESET_COLORS[idx]);
+          }
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [active, toggleLaser, laserActive, handleUndo, handleRedo]);
+
+  // ── Sync strokeWidth to tool defaults on tool change ──────────────────────────
+  useEffect(() => {
+    if (tool !== 'eraser') {
+      setStrokeWidth(TOOL_DEFAULTS[tool]?.width ?? 2);
+    }
+  }, [tool]);
+
+  // ── Cursor style ──────────────────────────────────────────────────────────────
+  const cursorStyle = () => {
+    if (tool === 'laser') return 'none'; // cursor hidden via body; laser canvas shows dot
+    if (tool === 'eraser') return 'none';
+    if (tool === 'highlighter') return 'cell';
+    if (tool === 'text') return 'text';
+    return 'crosshair';
+  };
+
+  // ── Render ────────────────────────────────────────────────────────────────────
+  const toolButtons: { id: DrawTool; icon: React.ReactNode; label: string }[] = [
+    { id: 'pen',         icon: <Pen size={13}/>,       label: 'Pen (P)'         },
+    { id: 'pencil',      icon: <span style={{fontSize:11,fontWeight:700}}>✏</span>, label: 'Pencil (B)' },
+    { id: 'marker',      icon: <span style={{fontSize:11,fontWeight:700}}>▌</span>, label: 'Marker (M)' },
+    { id: 'highlighter', icon: <Highlighter size={13}/>, label: 'Highlighter (H)' },
+    { id: 'eraser',      icon: <Eraser size={13}/>,    label: 'Eraser (E)'      },
+    { id: 'line',        icon: <Minus size={13}/>,     label: 'Line'            },
+    { id: 'rect',        icon: <Square size={13}/>,    label: 'Rectangle (R)'   },
+    { id: 'circle',      icon: <Circle size={13}/>,    label: 'Circle (O)'      },
+    { id: 'arrow',       icon: <ArrowRight size={13}/>,label: 'Arrow (A)'       },
+    { id: 'text',        icon: <Type size={13}/>,      label: 'Text (T)'        },
+  ];
+
+  const btnBase = "w-7 h-7 rounded-lg flex items-center justify-center text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors";
+  const btnActive = "bg-indigo-100 dark:bg-indigo-900/50 text-indigo-600 dark:text-indigo-400 ring-1 ring-indigo-400";
+  const sep = <div className="h-5 w-px bg-gray-200 dark:bg-gray-600 mx-0.5 shrink-0" />;
+
+  return (
+    <>
+      {/* ── Whiteboard stroke canvas ──────────────────────────────────────── */}
+      {/* Stroke canvas — pointer-events active when whiteboard is enabled and not in laser mode */}
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 transition-opacity"
+        style={{
+          zIndex: 10,
+          opacity: active ? 1 : 0.4,
+          pointerEvents: active && tool !== 'laser' ? 'all' : 'none',
+          cursor: active ? cursorStyle() : 'default',
+        }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={clearEraserRing}
+      />
+
+      {/* ── Eraser ring canvas ────────────────────────────────────────────── */}
+      <canvas
+        ref={eraserCanvasRef}
+        className="absolute inset-0"
+        style={{ zIndex: 11, pointerEvents: 'none' }}
+      />
+
+      {/* ── Laser canvas ──────────────────────────────────────────────────── */}
+      <canvas
+        ref={laserCanvasRef}
+        className="absolute inset-0"
+        style={{
+          zIndex: 50,
+          pointerEvents: 'none',
+          cursor: 'none',
+        }}
+      />
+
+      {/* ── Debug overlay (only when ?laserDebug=1) ─────────────────────── */}
+      {laserDebug && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 8,
+            left: 8,
+            width: 220,
+            zIndex: 99999,
+            padding: '8px 10px',
+            background: 'rgba(0,0,0,0.78)',
+            color: '#7CFC00',
+            font: '11px ui-monospace, SFMono-Regular, Menlo, monospace',
+            borderRadius: 6,
+            border: '1px solid #1f6f1f',
+            pointerEvents: 'none',
+            lineHeight: 1.45,
+          }}
+          data-debug-tick={debugTick}
+        >
+          <div style={{ color: '#fff', fontWeight: 700, marginBottom: 4 }}>
+            laser debug
+          </div>
+          <div>laser tool: {laserActive ? 'on' : 'off'}</div>
+          <div style={{ color: '#7CFC00' }}>mode: always-paint</div>
+          <div>cursor: {cursorPos.current
+            ? `${Math.round(cursorPos.current.x)}, ${Math.round(cursorPos.current.y)}`
+            : '—'}</div>
+          <div>cursor-vis: {String(cursorVisible.current)}</div>
+          <div>trail points: {laserPoints.current.length}</div>
+          <div>last event: {lastEventRef.current}</div>
+          <div>color/fade/tip: {laserColor}/{laserFade}/{laserTipSize}</div>
+        </div>
+      )}
+
+      {/* ── Text input overlay: rendered as position:fixed so it sits at exact screen coords */}
+      {/* Backdrop div catches outside-clicks and commits; input is above it at z:9999 */}
+      {textInput && (
+        <>
+          {/* Full-screen backdrop: clicks here commit the text */}
+          <div
+            style={{ position: 'fixed', inset: 0, zIndex: 9998, pointerEvents: 'all', cursor: 'text' }}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              // Snapshot current values at commit time to avoid stale closure
+              const snap = textInputRef.current?.value ?? textValue;
+              doCommitText(textInput, snap);
+            }}
+          />
+          {/* The actual input — position:fixed at click screen coords, above backdrop */}
+          <input
+            ref={textInputRef}
+            value={textValue}
+            onChange={e => setTextValue(e.target.value)}
+            onKeyDown={e => {
+              e.stopPropagation();
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                const snap = e.currentTarget.value;
+                doCommitText(textInput, snap);
+              }
+              if (e.key === 'Escape') { setTextInput(null); setTextValue(''); }
+            }}
+            onPointerDown={e => e.stopPropagation()}
+            onClick={e => e.stopPropagation()}
+            className="bg-white/90 dark:bg-gray-800/90 border-2 border-indigo-400 rounded px-2 py-0.5 outline-none shadow-lg"
+            style={{
+              position: 'fixed',
+              left: textInput.screenX,
+              top: textInput.screenY - 4,
+              minWidth: 140,
+              zIndex: 9999,
+              pointerEvents: 'all',
+              fontSize: Math.min(48, Math.max(12, strokeWidth * 6)),
+              color,
+            }}
+            placeholder="Type here, Enter ↵"
+          />
+        </>
+      )}
+
+      {/* ── Floating toolbar ──────────────────────────────────────────────── */}
+      {active && (
+        <div
+          className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-1 flex-wrap max-w-[90vw]"
+          style={{ zIndex: 60, filter: 'drop-shadow(0 4px 16px rgba(0,0,0,0.18))' }}
+        >
+          <div className="flex items-center gap-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-2xl px-2.5 py-1.5 shadow-xl">
+
+            {toolButtons.map(t => (
+              <TooltipBtn
+                key={t.id}
+                title={t.label}
+                onClick={() => { setTool(t.id); if (t.id !== 'laser') setLaserActive(false); }}
+                className={`${btnBase} ${tool === t.id && !laserActive ? btnActive : ''}`}
+              >
+                {t.icon}
+              </TooltipBtn>
+            ))}
+
+            {sep}
+
+            {/* FIX 2: Eraser S/M/L size selector (only when eraser active) */}
+            {tool === 'eraser' && (
+              <>
+                <div className="flex items-center gap-0.5">
+                  {(['S', 'M', 'L'] as EraserSize[]).map(sz => (
+                    <TooltipBtn
+                      key={sz}
+                      title={`Eraser ${sz === 'S' ? 'Small (12px)' : sz === 'M' ? 'Medium (24px)' : 'Large (48px)'}`}
+                      onClick={() => setEraserSize(sz)}
+                      className={`w-6 h-6 text-[10px] font-bold rounded ${eraserSize === sz
+                        ? 'bg-indigo-100 dark:bg-indigo-900/50 text-indigo-600 ring-1 ring-indigo-400'
+                        : btnBase}`}
+                    >
+                      {sz}
+                    </TooltipBtn>
+                  ))}
+                </div>
+                {sep}
+              </>
+            )}
+
+            {/* Preset colors */}
+            <div className="flex items-center gap-0.5">
+              {PRESET_COLORS.map((c, i) => (
+                <button
+                  key={c}
+                  title={`Color ${i + 1}`}
+                  onClick={() => setColor(c)}
+                  className="w-4 h-4 rounded-full border-2 transition-transform hover:scale-125"
+                  style={{
+                    background: c,
+                    borderColor: color === c ? '#6366f1' : 'transparent',
+                    boxShadow: c === '#ffffff' ? 'inset 0 0 0 1px #d1d5db' : undefined,
+                  }}
+                />
+              ))}
+              <input
+                type="color"
+                value={color}
+                onChange={e => setColor(e.target.value)}
+                className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent"
+                title="Custom color"
+              />
+            </div>
+
+            {sep}
+
+            {/* Stroke width S/M/L */}
+            <div className="flex items-center gap-0.5">
+              {([['S',1],['M',4],['L',10]] as [string, number][]).map(([label, val]) => (
+                <TooltipBtn
+                  key={label}
+                  title={`Stroke ${label === 'S' ? 'Small' : label === 'M' ? 'Medium' : 'Large'}`}
+                  onClick={() => setStrokeWidth(val)}
+                  className={`w-6 h-6 text-[10px] font-bold rounded ${strokeWidth === val ? btnActive : btnBase}`}
+                >
+                  {label}
+                </TooltipBtn>
+              ))}
+            </div>
+
+            {sep}
+
+            <TooltipBtn
+              title="Undo (Ctrl+Z)"
+              onClick={handleUndo}
+              disabled={!undoStack.length}
+              className={`${btnBase} ${!undoStack.length ? 'opacity-30' : ''}`}
+            >
+              <Undo2 size={13}/>
+            </TooltipBtn>
+            <TooltipBtn
+              title="Redo (Ctrl+Shift+Z)"
+              onClick={handleRedo}
+              disabled={!redoStack.length}
+              className={`${btnBase} ${!redoStack.length ? 'opacity-30' : ''}`}
+            >
+              <Redo2 size={13}/>
+            </TooltipBtn>
+
+            {sep}
+
+            {confirmClear ? (
+              <>
+                <span className="text-[10px] text-red-500 font-medium">Clear all?</span>
+                <button onClick={handleClear} className="text-[10px] px-1.5 py-0.5 bg-red-500 text-white rounded font-medium">Yes</button>
+                <button onClick={() => setConfirmClear(false)} className="text-[10px] px-1.5 py-0.5 bg-gray-200 dark:bg-gray-700 rounded font-medium">No</button>
+              </>
+            ) : (
+              <TooltipBtn
+                title="Clear all annotations"
+                onClick={() => setConfirmClear(true)}
+                className={`${btnBase} text-red-400`}
+              >
+                <Trash2 size={13}/>
+              </TooltipBtn>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Laser toggle pill ─────────────────────────────────────────────── */}
+      <div
+        className="absolute bottom-6 right-6 flex flex-col items-end gap-1"
+        style={{ zIndex: 70 }}
+      >
+        {showLaserConfig && (
+          <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-xl p-3 text-xs w-44 mb-1">
+            <div className="font-semibold text-gray-600 dark:text-gray-300 mb-2">Laser config</div>
+            <div className="mb-2">
+              <div className="text-gray-400 mb-1">Color</div>
+              <div className="flex gap-1">
+                {(['red','green','blue','yellow'] as const).map(c => (
+                  <button key={c} onClick={() => setLaserColor(c)}
+                    className={`w-5 h-5 rounded-full border-2 ${laserColor === c ? 'border-indigo-500' : 'border-transparent'}`}
+                    style={{ background: LASER_COLORS[c] }}/>
+                ))}
+              </div>
+            </div>
+            <div className="mb-2">
+              <div className="text-gray-400 mb-1">Trail length</div>
+              <div className="flex gap-1">
+                {(['short','medium','long'] as const).map(v => (
+                  <button key={v} onClick={() => setLaserFade(v)}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium capitalize ${laserFade === v ? 'bg-indigo-500 text-white' : 'bg-gray-100 dark:bg-gray-700'}`}>
+                    {v}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="text-gray-400 mb-1">Tip size</div>
+              <div className="flex gap-1">
+                {(['S','M','L'] as const).map(v => (
+                  <button key={v} onClick={() => setLaserTipSize(v)}
+                    className={`w-6 h-6 rounded text-[10px] font-bold ${laserTipSize === v ? 'bg-indigo-500 text-white' : 'bg-gray-100 dark:bg-gray-700'}`}>
+                    {v}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center gap-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-full px-2 py-1.5 shadow-xl">
+          <TooltipBtn
+            title="Laser settings"
+            onClick={() => setShowLaserConfig(v => !v)}
+            className={`${btnBase} text-[10px]`}
+          >
+            ⚙
+          </TooltipBtn>
+          <TooltipBtn
+            title="Laser pointer (L)"
+            onClick={toggleLaser}
+            className={`${btnBase} ${laserActive ? 'bg-red-100 dark:bg-red-900/50 text-red-500 ring-1 ring-red-400' : ''}`}
+          >
+            <Zap size={13}/>
+          </TooltipBtn>
+          {laserActive && (
+            <span className="text-[9px] font-medium text-red-500 px-0.5">LIVE</span>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}

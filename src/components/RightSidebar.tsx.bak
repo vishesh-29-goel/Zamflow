@@ -1,0 +1,377 @@
+import React, { useState } from 'react';
+import { useStore } from 'reactflow';
+import { Settings, Wand2, GitBranch, X, RotateCcw, Trash2, Plus, ChevronLeft, ChevronRight } from 'lucide-react';
+import { useZampFlowStore } from '../store/useZampFlowStore';
+import { parseTextToFlow } from '../lib/textToFlow';
+
+type Tab = 'properties' | 'ai' | 'versions';
+
+function PropertiesTab() {
+  const { activeProcess, updateNodeData, updateEdgeData, setNodes, setEdges, pushHistory } = useZampFlowStore();
+  const selectedNodes = useStore(s => s.getNodes().filter(n => n.selected));
+  const selectedEdges = useStore(s => s.edges.filter(e => e.selected));
+  const proc = activeProcess();
+
+  if (!proc) return <div className="p-4 text-xs text-gray-400">No process selected</div>;
+  if (selectedNodes.length === 0 && selectedEdges.length === 0) {
+    return (
+      <div className="p-4 text-xs text-gray-400 text-center">
+        Select a node or edge to edit properties
+      </div>
+    );
+  }
+
+  // ── Node properties ─────────────────────────────────────────────────────
+  if (selectedNodes.length > 0) {
+    const node = selectedNodes[0];
+    const data = node.data;
+
+    const handleDeleteNode = () => {
+      pushHistory();
+      const currentProc = useZampFlowStore.getState().activeProcess();
+      if (!currentProc) return;
+      setNodes(currentProc.nodes.filter(n => n.id !== node.id));
+      setEdges(currentProc.edges.filter(e => e.source !== node.id && e.target !== node.id));
+    };
+
+    return (
+      <div className="p-3 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
+            Node Properties
+          </div>
+          {/* Delete button — 3rd way to delete besides keyboard & right-click */}
+          <button
+            onClick={handleDeleteNode}
+            className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 border border-red-200 dark:border-red-800"
+            title="Delete node (or press Delete/Backspace)"
+          >
+            <Trash2 size={11} /> Delete
+          </button>
+        </div>
+        <div>
+          <label className="text-xs text-gray-500 dark:text-gray-400">Label</label>
+          <input
+            value={data.label}
+            onChange={e => updateNodeData(node.id, { label: e.target.value })}
+            className="input-field mt-1"
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-xs text-gray-500 dark:text-gray-400">Fill Color</label>
+            <input
+              type="color"
+              value={data.color || '#ffffff'}
+              onChange={e => updateNodeData(node.id, { color: e.target.value })}
+              className="mt-1 w-full h-8 rounded border border-gray-200 dark:border-gray-600 cursor-pointer"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500 dark:text-gray-400">Border Color</label>
+            <input
+              type="color"
+              value={data.borderColor || '#6366f1'}
+              onChange={e => updateNodeData(node.id, { borderColor: e.target.value })}
+              className="mt-1 w-full h-8 rounded border border-gray-200 dark:border-gray-600 cursor-pointer"
+            />
+          </div>
+        </div>
+        <div>
+          <label className="text-xs text-gray-500 dark:text-gray-400">Font Size</label>
+          <input
+            type="number" min={9} max={24}
+            value={data.fontSize || 13}
+            onChange={e => updateNodeData(node.id, { fontSize: Number(e.target.value) })}
+            className="input-field mt-1"
+          />
+        </div>
+        <div>
+          <label className="text-xs text-gray-500 dark:text-gray-400">Notes</label>
+          <textarea
+            value={data.notes || ''}
+            onChange={e => updateNodeData(node.id, { notes: e.target.value })}
+            className="input-field mt-1 h-16 resize-none"
+            placeholder="Add notes..."
+          />
+        </div>
+        <MetadataEditor nodeId={node.id} metadata={data.metadata || {}} />
+      </div>
+    );
+  }
+
+  // ── Edge properties ─────────────────────────────────────────────────────
+  if (selectedEdges.length > 0) {
+    const edge = selectedEdges[0];
+    const edata = edge.data || {};
+
+    const handleDeleteEdge = () => {
+      pushHistory();
+      const currentProc = useZampFlowStore.getState().activeProcess();
+      if (!currentProc) return;
+      setEdges(currentProc.edges.filter(e => e.id !== edge.id));
+    };
+
+    return (
+      <div className="p-3 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
+            Edge Properties
+          </div>
+          <button
+            onClick={handleDeleteEdge}
+            className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 border border-red-200 dark:border-red-800"
+            title="Delete edge (or press Delete/Backspace)"
+          >
+            <Trash2 size={11} /> Delete
+          </button>
+        </div>
+        <div>
+          <label className="text-xs text-gray-500 dark:text-gray-400">Style</label>
+          <select
+            value={edata.edgeType || 'smoothstep'}
+            onChange={e => updateEdgeData(edge.id, { edgeType: e.target.value as any })}
+            className="input-field mt-1"
+          >
+            <option value="straight">Straight</option>
+            <option value="smoothstep">Elbow</option>
+            <option value="bezier">Bezier</option>
+          </select>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-xs text-gray-500 dark:text-gray-400">Color</label>
+            <input
+              type="color"
+              value={edata.color || '#6366f1'}
+              onChange={e => updateEdgeData(edge.id, { color: e.target.value })}
+              className="mt-1 w-full h-8 rounded border border-gray-200 dark:border-gray-600 cursor-pointer"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500 dark:text-gray-400">Thickness</label>
+            <input
+              type="number" min={1} max={8}
+              value={edata.thickness || 2}
+              onChange={e => updateEdgeData(edge.id, { thickness: Number(e.target.value) })}
+              className="input-field mt-1"
+            />
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!!edata.dashed}
+              onChange={e => updateEdgeData(edge.id, { dashed: e.target.checked })}
+            /> Dashed
+          </label>
+          <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={edata.arrow !== false}
+              onChange={e => updateEdgeData(edge.id, { arrow: e.target.checked })}
+            /> Arrow
+          </label>
+        </div>
+        <div>
+          <label className="text-xs text-gray-500 dark:text-gray-400">Condition Label</label>
+          <select
+            value={edata.conditionLabel || ''}
+            onChange={e => updateEdgeData(edge.id, { conditionLabel: e.target.value })}
+            className="input-field mt-1"
+          >
+            <option value="">None</option>
+            <option value="Yes">Yes</option>
+            <option value="No">No</option>
+            <option value="Maybe">Maybe</option>
+            <option value="Retry">Retry</option>
+            <option value="Escalate">Escalate</option>
+            <option value="Custom">Custom</option>
+          </select>
+        </div>
+      </div>
+    );
+  }
+  return null;
+}
+
+function MetadataEditor({ nodeId, metadata }: { nodeId: string; metadata: Record<string, string> }) {
+  const { updateNodeData } = useZampFlowStore();
+  const [entries, setEntries] = useState(Object.entries(metadata));
+
+  const addEntry = () => setEntries(e => [...e, ['', '']]);
+  const updateEntry = (i: number, k: string, v: string) => {
+    const next = [...entries]; next[i] = [k, v]; setEntries(next);
+    updateNodeData(nodeId, { metadata: Object.fromEntries(next.filter(([key]) => key)) });
+  };
+  const removeEntry = (i: number) => {
+    const next = entries.filter((_, j) => j !== i); setEntries(next);
+    updateNodeData(nodeId, { metadata: Object.fromEntries(next.filter(([key]) => key)) });
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <label className="text-xs text-gray-500 dark:text-gray-400">Metadata</label>
+        <button onClick={addEntry} className="p-0.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-accent-500">
+          <Plus size={12} />
+        </button>
+      </div>
+      {entries.map(([k, v], i) => (
+        <div key={i} className="flex gap-1 mb-1">
+          <input value={k} onChange={e => updateEntry(i, e.target.value, v)} placeholder="Key" className="input-field !text-xs flex-1" />
+          <input value={v} onChange={e => updateEntry(i, k, e.target.value)} placeholder="Value" className="input-field !text-xs flex-1" />
+          <button onClick={() => removeEntry(i)} className="p-1 text-gray-400 hover:text-red-500">
+            <X size={10} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AIGeneratorTab() {
+  const [text, setText] = useState('');
+  const { setNodes, setEdges } = useZampFlowStore();
+
+  const generate = () => {
+    if (!text.trim()) return;
+    const { nodes, edges } = parseTextToFlow(text);
+    setNodes(nodes);
+    setEdges(edges);
+  };
+
+  const example = `Start\nReceive request -> Validate input\nif valid?\nProcess request\nEnd\nif invalid? -> Return error -> End`;
+
+  return (
+    <div className="p-3 space-y-3">
+      <div className="text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide flex items-center gap-1">
+        <Wand2 size={12} /> Text to Flowchart
+      </div>
+      <div className="text-xs text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/50 rounded-lg p-2">
+        <strong>Syntax:</strong> Each line = node. Use <code>-&gt;</code> for flow.
+        Keywords: <code>if/decide/check</code> → diamond. <code>start/end</code> → oval.
+      </div>
+      <textarea
+        value={text} onChange={e => setText(e.target.value)}
+        placeholder={example}
+        className="input-field h-36 resize-none font-mono text-xs"
+      />
+      <div className="flex gap-2">
+        <button onClick={generate} className="btn-primary flex-1 flex items-center justify-center gap-1 !text-xs">
+          <Wand2 size={12} /> Generate
+        </button>
+        <button onClick={() => setText(example)} className="btn-secondary !text-xs">Example</button>
+      </div>
+    </div>
+  );
+}
+
+function VersionsTab() {
+  const { activeProcess, saveVersion, restoreVersion, deleteVersion } = useZampFlowStore();
+  const [note, setNote] = useState('');
+  const proc = activeProcess();
+  if (!proc) return <div className="p-4 text-xs text-gray-400">No process selected</div>;
+
+  const versions = [...proc.versions].reverse();
+
+  return (
+    <div className="p-3 space-y-3">
+      <div className="text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide flex items-center gap-1">
+        <GitBranch size={12} /> Versions
+      </div>
+      <div className="flex gap-2">
+        <input
+          value={note}
+          onChange={e => setNote(e.target.value)}
+          placeholder="Version note..."
+          className="input-field flex-1 !text-xs"
+        />
+        <button
+          onClick={() => { saveVersion(note || 'Manual save'); setNote(''); }}
+          className="btn-primary !text-xs !px-2"
+        >Save</button>
+      </div>
+      <div className="space-y-2">
+        {versions.length === 0 && (
+          <div className="text-xs text-gray-400 text-center py-3">No versions saved yet</div>
+        )}
+        {versions.map(v => (
+          <div key={v.id} className="rounded-xl border border-gray-200 dark:border-gray-700 p-2.5 bg-gray-50 dark:bg-gray-800/50">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-accent-600 dark:text-accent-400">{v.label}</span>
+              <div className="flex gap-1">
+                <button
+                  onClick={() => { if (confirm('Restore this version?')) restoreVersion(v.id); }}
+                  className="p-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500"
+                  title="Restore"
+                ><RotateCcw size={11} /></button>
+                <button
+                  onClick={() => { if (confirm('Delete version?')) deleteVersion(v.id); }}
+                  className="p-0.5 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-red-400"
+                  title="Delete"
+                ><Trash2 size={11} /></button>
+              </div>
+            </div>
+            {v.note && <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{v.note}</p>}
+            <p className="text-xs text-gray-400 mt-0.5">{new Date(v.created_at).toLocaleString()}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function RightSidebar() {
+  const [tab, setTab] = useState<Tab>('properties');
+  const [collapsed, setCollapsed] = useState(false);
+
+  if (collapsed) {
+    return (
+      <div className="w-8 border-l border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex flex-col items-center py-2">
+        <button onClick={() => setCollapsed(false)} className="toolbar-btn w-6 h-6">
+          <ChevronLeft size={14} />
+        </button>
+      </div>
+    );
+  }
+
+  const tabs: { id: Tab; icon: React.ReactNode; label: string }[] = [
+    { id: 'properties', icon: <Settings size={13} />, label: 'Props' },
+    { id: 'ai',         icon: <Wand2 size={13} />,    label: 'AI' },
+    { id: 'versions',   icon: <GitBranch size={13} />, label: 'Versions' },
+  ];
+
+  return (
+    <div className="w-60 flex-shrink-0 border-l border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex flex-col overflow-hidden">
+      {/* Tab bar */}
+      <div className="flex border-b border-gray-200 dark:border-gray-700">
+        {tabs.map(t => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={`flex-1 flex flex-col items-center py-2 gap-0.5 text-[10px] transition-colors ${
+              tab === t.id
+                ? 'text-accent-600 dark:text-accent-400 border-b-2 border-accent-500'
+                : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
+            }`}
+          >
+            {t.icon}{t.label}
+          </button>
+        ))}
+        <button
+          onClick={() => setCollapsed(true)}
+          className="px-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+        >
+          <ChevronRight size={13} />
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {tab === 'properties' && <PropertiesTab />}
+        {tab === 'ai'         && <AIGeneratorTab />}
+        {tab === 'versions'   && <VersionsTab />}
+      </div>
+    </div>
+  );
+}

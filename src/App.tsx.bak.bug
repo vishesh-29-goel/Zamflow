@@ -1,0 +1,197 @@
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { ReactFlowProvider, useReactFlow } from 'reactflow';
+import { Toolbar } from './components/Toolbar';
+import { LeftSidebar } from './components/LeftSidebar';
+import { RightSidebar } from './components/RightSidebar';
+import { Canvas } from './components/Canvas';
+import { BottomBar } from './components/BottomBar';
+import { SignInScreen } from './components/SignInScreen';
+import { FlowsPanel } from './components/FlowsPanel';
+import { LegacyImportBanner } from './components/LegacyImportBanner';
+import { useZampFlowStore } from './store/useZampFlowStore';
+import { useAuthStore } from './auth/useAuth';
+import { useFlows } from './lib/useFlows';
+import { getImportFromURL } from './lib/urlImport';
+import { config, configIsValid } from './config';
+import { Node, Edge } from 'reactflow';
+import { NodeData, EdgeData } from './store/types';
+import { FlowData } from './lib/supabase';
+
+// ─── Toast ─────────────────────────────────────────────────────────────────
+function Toast({ message, onDone }: { message: string; onDone: () => void }) {
+  useEffect(() => {
+    const t = setTimeout(onDone, 3500);
+    return () => clearTimeout(t);
+  }, [onDone]);
+  return (
+    <div style={{
+      position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)',
+      background: '#1e293b', color: '#f8fafc', padding: '10px 20px',
+      borderRadius: 8, zIndex: 9999, fontSize: 14, boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+      pointerEvents: 'none',
+    }}>
+      {message}
+    </div>
+  );
+}
+
+// ─── Expiry watcher ─────────────────────────────────────────────────────────
+function ExpiryWatcher({ onExpired }: { onExpired: () => void }) {
+  const { user, checkExpiry } = useAuthStore();
+  useEffect(() => {
+    if (!user) return;
+    const interval = setInterval(() => {
+      const valid = checkExpiry();
+      if (!valid) onExpired();
+    }, 60_000);
+    return () => clearInterval(interval);
+  }, [user, checkExpiry, onExpired]);
+  return null;
+}
+
+// ─── Inner app ───────────────────────────────────────────────────────────────
+function AppInner() {
+  const [whiteboardMode, setWhiteboardMode] = useState(false);
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const { theme, setTheme, undo, redo, saveVersion, preferences, setPreference } = useZampFlowStore();
+  const { user } = useAuthStore();
+  const flowsApi = useFlows(user);
+  const { setViewport } = useReactFlow();
+  const cloudEnabled = configIsValid();
+
+  useEffect(() => {
+    if (theme === 'dark') document.documentElement.classList.add('dark');
+    else document.documentElement.classList.remove('dark');
+  }, [theme]);
+
+  const handleExpired = useCallback(() => {
+    setToast('Session expired. Please sign in again.');
+  }, []);
+
+  const loadFlowIntoCanvas = useCallback(async (id: string) => {
+    const row = await flowsApi.loadFlow(id);
+    if (!row) return;
+    const data = row.data as FlowData;
+    useZampFlowStore.setState(state => {
+      const proc = {
+        id,
+        name: row.name,
+        description: '',
+        category: 'General',
+        tags: [],
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        archived: false,
+        nodes: (data.nodes as Node<NodeData>[]) ?? [],
+        edges: (data.edges as Edge<EdgeData>[]) ?? [],
+        whiteboard: { strokes: [], stickies: [] },
+        versions: [],
+        history: { undo: [], redo: [] },
+      };
+      const others = state.processes.filter(p => p.id !== id);
+      return { processes: [...others, proc], activeProcessId: id };
+    });
+    if (data.viewport) setViewport(data.viewport);
+  }, [flowsApi, setViewport]);
+
+  // Load flow when currentFlowId changes
+  useEffect(() => {
+    if (flowsApi.currentFlowId) {
+      loadFlowIntoCanvas(flowsApi.currentFlowId);
+    }
+  }, [flowsApi.currentFlowId]); // eslint-disable-line
+
+  // Auto-save: subscribe to store changes and schedule Supabase write
+  const autoSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!user || !cloudEnabled || !flowsApi.currentFlowId) return;
+    const unsubscribe = useZampFlowStore.subscribe((state) => {
+      const proc = state.processes.find(p => p.id === flowsApi.currentFlowId);
+      if (!proc) return;
+      const flowData: FlowData = { version: 1, nodes: proc.nodes, edges: proc.edges };
+      flowsApi.scheduleSave(flowsApi.currentFlowId, proc.name, flowData);
+    });
+    return unsubscribe;
+  }, [user, cloudEnabled, flowsApi.currentFlowId]); // eslint-disable-line
+
+  // URL import
+  useEffect(() => {
+    let cancelled = false;
+    getImportFromURL().then(result => {
+      if (cancelled || !result) return;
+      if (result.error) { setToast(result.toastMessage); return; }
+      const s = useZampFlowStore.getState();
+      useZampFlowStore.setState({
+        processes: [...s.processes, result.process],
+        activeProcessId: result.process.id,
+      });
+      useZampFlowStore.getState().triggerSave();
+      setToast(result.toastMessage);
+    });
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+      else if (mod && e.key === 'z' && e.shiftKey) { e.preventDefault(); redo(); }
+      else if (mod && e.key === 's') { e.preventDefault(); saveVersion(); }
+      else if ((e.key === 'w' || e.key === 'W') && (e.target as HTMLElement).tagName !== 'INPUT' && (e.target as HTMLElement).tagName !== 'TEXTAREA')
+        setWhiteboardMode(v => !v);
+      else if ((e.key === 'g' || e.key === 'G') && (e.target as HTMLElement).tagName !== 'INPUT')
+        setPreference('showGrid', !preferences.showGrid);
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [undo, redo, saveVersion, preferences.showGrid, setPreference]);
+
+  return (
+    <div className="h-screen flex flex-col bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 overflow-hidden">
+      <ExpiryWatcher onExpired={handleExpired} />
+      {toast && <Toast message={toast} onDone={() => setToast(null)} />}
+      <Toolbar
+        whiteboardMode={whiteboardMode}
+        onToggleWhiteboard={() => setWhiteboardMode(v => !v)}
+        canvasRef={canvasRef}
+        flowsApi={cloudEnabled ? flowsApi : undefined}
+      />
+      <div className="flex flex-1 overflow-hidden">
+        {user && cloudEnabled ? (
+          <FlowsPanel flowsApi={flowsApi} onFlowSelect={loadFlowIntoCanvas} />
+        ) : (
+          <LeftSidebar />
+        )}
+        <Canvas whiteboardMode={whiteboardMode} canvasRef={canvasRef} />
+        <RightSidebar />
+      </div>
+      <BottomBar />
+      {user && cloudEnabled && (
+        <LegacyImportBanner
+          flowsApi={flowsApi}
+          onImported={() => setToast('Local flows imported to your account!')}
+        />
+      )}
+      {user && !cloudEnabled && (
+        <div className="fixed bottom-14 left-1/2 -translate-x-1/2 z-50 bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-700 rounded-xl px-4 py-2 text-xs text-yellow-800 dark:text-yellow-200 shadow-md">
+          ⚠️ Supabase not configured — add anon key + URL to complete cloud save setup.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Root: auth gate ────────────────────────────────────────────────────────
+export default function App() {
+  const { user } = useAuthStore();
+
+  if (!user) return <SignInScreen />;
+
+  return (
+    <ReactFlowProvider>
+      <AppInner />
+    </ReactFlowProvider>
+  );
+}

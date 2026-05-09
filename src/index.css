@@ -1,0 +1,63 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  html, body, #root { height: 100%; margin: 0; padding: 0; }
+  body { font-family: 'Inter', system-ui, sans-serif; }
+}
+
+@layer components {
+  .toolbar-btn {
+    @apply flex items-center justify-center w-8 h-8 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 hover:text-gray-700 dark:hover:text-gray-200 transition-colors cursor-pointer;
+  }
+  .toolbar-btn-active {
+    @apply bg-accent-100 dark:bg-accent-900/40 text-accent-600 dark:text-accent-400;
+  }
+  .panel-section {
+    @apply border-b border-gray-200 dark:border-gray-700 p-3;
+  }
+  .input-field {
+    @apply w-full px-2 py-1.5 text-sm rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-accent-400 dark:focus:ring-accent-500 transition-all;
+  }
+  .btn-primary {
+    @apply px-3 py-1.5 bg-accent-600 hover:bg-accent-700 text-white text-sm font-medium rounded-lg transition-colors;
+  }
+  .btn-secondary {
+    @apply px-3 py-1.5 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 text-sm font-medium rounded-lg transition-colors;
+  }
+}
+
+.react-flow__background { background-color: transparent; }
+.react-flow__minimap { border-radius: 12px; overflow: hidden; }
+
+/* Handle visibility: hidden at rest, visible on node hover or active connection */
+.react-flow__node:hover .zampflow-handle,
+.react-flow__node.selected .zampflow-handle,
+.react-flow__handle-connecting .zampflow-handle,
+.react-flow__handle-valid .zampflow-handle {
+  opacity: 1 !important;
+}
+
+/* Enlarge handle slightly when a connection drag is in progress */
+.react-flow__handle-connecting,
+.react-flow__handle-valid {
+  opacity: 1 !important;
+  transform: scale(1.25);
+}
+
+/* Ensure handles always receive pointer events regardless of parent overflow */
+.zampflow-handle {
+  pointer-events: all !important;
+  cursor: crosshair;
+}
+
+.node-shape { cursor: pointer; transition: filter 0.15s; }
+.node-shape:hover { filter: brightness(1.05); }
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 2px; }
+.dark ::-webkit-scrollbar-thumb { background: #4b5563; }

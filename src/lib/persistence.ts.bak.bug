@@ -1,0 +1,46 @@
+import { AppState } from '../store/types';
+import { TEMPLATES } from '../templates';
+
+const KEY = 'zampflow.state.v1';
+
+function makeDemoProcess() {
+  const t = TEMPLATES.sop_workflow;
+  return {
+    id: crypto.randomUUID(),
+    name: 'My First Process (SOP)',
+    description: 'A demo SOP workflow. Edit or replace this.',
+    category: 'Operations',
+    tags: ['demo', 'sop'],
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    archived: false,
+    nodes: t.nodes,
+    edges: t.edges,
+    whiteboard: { strokes: [], stickies: [] },
+    versions: [],
+    history: { undo: [], redo: [] }
+  };
+}
+
+export function loadState(): AppState {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as AppState;
+      if (parsed && Array.isArray(parsed.processes)) return parsed;
+    }
+  } catch { /* corrupt */ }
+  const demo = makeDemoProcess();
+  return {
+    processes: [demo],
+    activeProcessId: demo.id,
+    theme: 'light',
+    preferences: { snapToGrid: false, showGrid: true, autoSave: true }
+  };
+}
+
+export function saveState(state: AppState) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(state));
+  } catch { /* quota exceeded */ }
+}
