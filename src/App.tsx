@@ -10,10 +10,7 @@ import { FlowsPanel } from './components/FlowsPanel';
 import { LegacyImportBanner } from './components/LegacyImportBanner';
 import { TextPanel } from './components/TextPanel';
 import { PublicViewer } from './components/PublicViewer';
-// TEST-ONLY: import is present only when VITE_TEST_LOGIN_TOKEN is defined at build time.
-// Vite tree-shakes the import when the constant is undefined (falsy branch never executes).
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-import { TestLogin } from './components/TestLogin';
+
 import { useZampFlowStore } from './store/useZampFlowStore';
 import { useAuthStore } from './auth/useAuth';
 import { useFlows } from './lib/useFlows';
@@ -267,11 +264,7 @@ function AppInner() {
 export default function App() {
   const { user } = useAuthStore();
 
-  // TEST-ONLY route: /#/test-login?token=...
-  // Uses hash routing so the static host never sees a non-root path (no 404).
-  // Only active when VITE_TEST_LOGIN_TOKEN is set at build time.
-  // The TestLogin component validates the token; this just routes the hash.
-  if (window.location.hash.startsWith('#/test-login')) return <TestLogin />;
+
 
   // Public viewer — no auth, hash or path-based routing
   const publicSlug = getPublicSlug();
